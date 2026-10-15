@@ -1,0 +1,292 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
+// Adapted from Opening Range template by © LuxAlgo for RORB Backtest Strategy
+
+//@version=6
+strategy(
+     title                   = "RORB Strategy [0.618 Pullback + Reversal]",
+     shorttitle              = "RORB v6",
+     overlay                 = true,
+     initial_capital         = 50000,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     currency                = currency.USD,
+     margin_long             = 0,
+     margin_short            = 0,
+     process_orders_on_close = true,
+     calc_on_every_tick      = false,
+     max_boxes_count         = 500,
+     max_lines_count         = 500,
+     max_labels_count        = 500
+ )
+
+//---------------------------------------------------------------------------------------------------------------------}
+// 1. INPUTS
+//---------------------------------------------------------------------------------------------------------------------{
+grp_sesh  = "Session & Timeframe (NY Time Alignment)"
+or_sesh_i = input.session("0930-0945", title = "15m RORB Range (NY Time)", group = grp_sesh, tooltip = "09:30-09:45 NY = 21:30-21:45 MYT (EDT) / 22:30-22:45 MYT (EST).")
+tr_sesh_i = input.session("0945-1200", title = "Active Trading Window (2.5h Total)", group = grp_sesh, tooltip = "09:45-12:00 NY = 21:45-00:00 MYT (EDT). Pending orders cancel at 12:00 NY.")
+tz_i      = input.string("America/New_York", title = "Timezone Reference", options = ["America/New_York", "Asia/Kuala_Lumpur", "UTC"], group = grp_sesh)
+flat_eod  = input.bool(true, title = "Force Close Leftover Trades at New Session Start", group = grp_sesh)
+
+grp_risk  = "Risk & Position Sizing"
+risk_usd  = input.float(300.0, title = "Risk Per Trade ($)", minval = 1.0, step = 10.0, group = grp_risk)
+inst_mode = input.string("Auto", title = "Instrument Mode", options = ["Auto", "Futures (Whole Contracts, Min 1)", "CFD (Fractional)"], group = grp_risk)
+
+grp_strat = "RORB Strategy Parameters"
+fib_lvl   = input.float(0.618, title = "Trade 1 Fib Pullback Level (From Breakout Edge)", minval = 0.1, maxval = 0.9, step = 0.001, group = grp_strat)
+t1_min_rr = input.float(1.0, title = "Trade 1 Min TP (R-Multiple)", minval = 0.5, step = 0.25, group = grp_strat)
+t1_max_rr = input.float(3.0, title = "Trade 1 Max TP (R-Multiple)", minval = 1.0, step = 0.25, group = grp_strat)
+t2_fix_rr = input.float(2.0, title = "Trade 2 Fixed TP (R-Multiple)", minval = 0.5, step = 0.25, group = grp_strat)
+
+grp_vis   = "Visuals & Debug"
+show_hist = input.bool(true, title = "Show Historical Ranges", group = grp_vis)
+or_color  = input.color(#787b86, title = "OR Levels Color", group = grp_vis)
+or_fill   = input.color(color.new(color.gray, 80), title = "OR Box Fill", group = grp_vis)
+bull_col  = input.color(#089981, title = "Long Level Color", group = grp_vis)
+bear_col  = input.color(#f23645, title = "Short Level Color", group = grp_vis)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// 2. POSITION SIZING FUNCTION
+//---------------------------------------------------------------------------------------------------------------------{
+calc_qty(float sl_dist) =>
+    float safe_dist     = math.max(sl_dist, syminfo.mintick)
+    float risk_per_unit = safe_dist * syminfo.pointvalue
+    float raw_qty       = risk_usd / risk_per_unit
+    bool  use_futures   = inst_mode == "Futures (Whole Contracts, Min 1)" or (inst_mode == "Auto" and syminfo.type == "futures")
+    float final_qty     = use_futures ? math.max(1.0, math.round(raw_qty)) : raw_qty
+    final_qty
+
+//---------------------------------------------------------------------------------------------------------------------}
+// 3. SESSION TIMING & OPENING RANGE CALCULATIONS
+//---------------------------------------------------------------------------------------------------------------------{
+bool in_or_sesh    = not na(time(timeframe.period, or_sesh_i, tz_i))
+bool in_trade_sesh = not na(time(timeframe.period, tr_sesh_i, tz_i))
+
+int  close_hr           = hour(time_close, tz_i)
+int  close_min          = minute(time_close, tz_i)
+bool cutoff_reached_now = in_trade_sesh and (close_hr > 12 or (close_hr == 12 and close_min >= 0))
+
+bool or_start = in_or_sesh and not in_or_sesh[1]
+bool or_end   = in_or_sesh[1] and not in_or_sesh
+
+var float orh      = na
+var float orl      = na
+var bool  or_valid = false
+
+var box  or_bx = na
+var line h_ln  = na
+var line l_ln  = na
+var line m_ln  = na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// 4. STATE MACHINE VARIABLES
+//---------------------------------------------------------------------------------------------------------------------{
+var int   sesh_state = 0
+var int   t1_dir     = 0
+var float t1_entry   = na
+var float t1_sl      = na
+var float t1_tp      = na
+var float t1_risk    = na
+var float recent_ext = na
+var int   closed_ref = 0
+
+var line  entry_ln   = na
+var line  tp_ln      = na
+
+//---------------------------------------------------------------------------------------------------------------------}
+// 5. DAILY RESET & RANGE BUILDING (09:30 - 09:45 NY)
+//---------------------------------------------------------------------------------------------------------------------{
+if or_start
+    strategy.cancel_all()
+    if flat_eod and strategy.position_size != 0
+        strategy.close_all(comment = "New Session Reset")
+
+    if not show_hist
+        box.delete(or_bx)
+        line.delete(h_ln)
+        line.delete(l_ln)
+        line.delete(m_ln)
+        line.delete(entry_ln)
+        line.delete(tp_ln)
+
+    orh        := high
+    orl        := low
+    or_valid   := false
+    sesh_state := 0
+    t1_dir     := 0
+    t1_entry   := na
+    t1_sl      := na
+    t1_tp      := na
+    t1_risk    := na
+    recent_ext := na
+    closed_ref := strategy.closedtrades
+
+    or_bx := box.new(bar_index, high, bar_index, low, bgcolor = or_fill, border_width = 0)
+
+if in_or_sesh
+    orh := math.max(nz(orh, high), high)
+    orl := math.min(nz(orl, low), low)
+    box.set_top(or_bx, orh)
+    box.set_bottom(or_bx, orl)
+    box.set_right(or_bx, bar_index)
+    if orh > orl
+        or_valid := true
+
+float orm = math.round_to_mintick(math.avg(orh, orl))
+float orw = math.abs(orh - orl)
+
+if or_end and or_valid
+    sesh_state := 1
+    closed_ref := strategy.closedtrades
+    h_ln := line.new(bar_index, orh, bar_index, orh, color = or_color, style = line.style_solid)
+    l_ln := line.new(bar_index, orl, bar_index, orl, color = or_color, style = line.style_solid)
+    m_ln := line.new(bar_index, orm, bar_index, orm, color = or_color, style = line.style_dashed)
+
+if not in_or_sesh and or_valid and in_trade_sesh
+    line.set_x2(h_ln, bar_index)
+    line.set_x2(l_ln, bar_index)
+    line.set_x2(m_ln, bar_index)
+
+//---------------------------------------------------------------------------------------------------------------------}
+// 6. EXECUTION ENGINE & STATE TRANSITIONS (09:45 - 12:00 NY)
+//---------------------------------------------------------------------------------------------------------------------{
+fire_trade_2(int rev_dir) =>
+    if rev_dir == -1
+        float sl_price  = math.round_to_mintick(high)
+        float risk_dist = math.max(sl_price - close, syminfo.mintick)
+        float tp_price  = math.round_to_mintick(close - (t2_fix_rr * risk_dist))
+        float qty_t2    = calc_qty(risk_dist)
+        strategy.entry("T2_Short", strategy.short, qty = qty_t2, comment = "T2 Rev Short")
+        strategy.exit("T2_Short_Exit", from_entry = "T2_Short", stop = sl_price, limit = tp_price, comment_loss = "T2 SL", comment_profit = "T2 TP (2R)")
+    else if rev_dir == 1
+        float sl_price  = math.round_to_mintick(low)
+        float risk_dist = math.max(close - sl_price, syminfo.mintick)
+        float tp_price  = math.round_to_mintick(close + (t2_fix_rr * risk_dist))
+        float qty_t2    = calc_qty(risk_dist)
+        strategy.entry("T2_Long", strategy.long, qty = qty_t2, comment = "T2 Rev Long")
+        strategy.exit("T2_Long_Exit", from_entry = "T2_Long", stop = sl_price, limit = tp_price, comment_loss = "T2 SL", comment_profit = "T2 TP (2R)")
+
+// --- STEP A: Process State 2 (Pending T1) & State 3 (Active T1) ---
+if sesh_state == 2
+    // Case 1: T1 filled AND exited on this same bar (e.g., 09:50 PM engulfing drop)
+    if strategy.closedtrades > closed_ref
+        strategy.cancel_all()
+        int   last_idx = strategy.closedtrades - 1
+        float exit_px  = strategy.closedtrades.exit_price(last_idx)
+        bool  hit_sl   = t1_dir == 1 ? (exit_px <= t1_sl + syminfo.mintick) : (exit_px >= t1_sl - syminfo.mintick)
+        if hit_sl
+            bool rev_close = t1_dir == 1 ? (close < orl) : (close > orh)
+            if rev_close and in_trade_sesh
+                fire_trade_2(-t1_dir)
+                sesh_state := 5
+            else if in_trade_sesh and not cutoff_reached_now
+                sesh_state := 4
+            else
+                sesh_state := 6
+        else
+            sesh_state := 6
+
+    // Case 2: T1 filled on this bar and is currently OPEN
+    else if strategy.position_size != 0
+        sesh_state := 3
+
+    // Case 3: T1 is STILL PENDING (unfilled)
+    else
+        if not in_trade_sesh or cutoff_reached_now
+            strategy.cancel_all()
+            sesh_state := 6
+        else
+            if t1_dir == 1
+                recent_ext := math.max(recent_ext, high)
+                float raw_tp_dist  = recent_ext - t1_entry
+                float clamped_dist = math.min(t1_max_rr * t1_risk, math.max(t1_min_rr * t1_risk, raw_tp_dist))
+                t1_tp := math.round_to_mintick(t1_entry + clamped_dist)
+                strategy.exit("T1_Long_Exit", from_entry = "T1_Long", stop = t1_sl, limit = t1_tp, comment_loss = "T1 SL", comment_profit = "T1 TP")
+                line.set_y1(tp_ln, t1_tp)
+                line.set_y2(tp_ln, t1_tp)
+                line.set_x2(tp_ln, bar_index)
+                line.set_x2(entry_ln, bar_index)
+            else if t1_dir == -1
+                recent_ext := math.min(recent_ext, low)
+                float raw_tp_dist  = t1_entry - recent_ext
+                float clamped_dist = math.min(t1_max_rr * t1_risk, math.max(t1_min_rr * t1_risk, raw_tp_dist))
+                t1_tp := math.round_to_mintick(t1_entry - clamped_dist)
+                strategy.exit("T1_Short_Exit", from_entry = "T1_Short", stop = t1_sl, limit = t1_tp, comment_loss = "T1 SL", comment_profit = "T1 TP")
+                line.set_y1(tp_ln, t1_tp)
+                line.set_y2(tp_ln, t1_tp)
+                line.set_x2(tp_ln, bar_index)
+                line.set_x2(entry_ln, bar_index)
+
+else if sesh_state == 3
+    line.set_x2(tp_ln, bar_index)
+    line.set_x2(entry_ln, bar_index)
+    if strategy.closedtrades > closed_ref
+        int   last_idx = strategy.closedtrades - 1
+        float exit_px  = strategy.closedtrades.exit_price(last_idx)
+        bool  hit_sl   = t1_dir == 1 ? (exit_px <= t1_sl + syminfo.mintick) : (exit_px >= t1_sl - syminfo.mintick)
+        if hit_sl
+            bool rev_close = t1_dir == 1 ? (close < orl) : (close > orh)
+            if rev_close and in_trade_sesh
+                fire_trade_2(-t1_dir)
+                sesh_state := 5
+            else if in_trade_sesh and not cutoff_reached_now
+                sesh_state := 4
+            else
+                sesh_state := 6
+        else
+            sesh_state := 6
+
+// --- STEP B: Process State 4 (T1 Stopped Out by Wick -> Waiting for Close Beyond OR for T2) ---
+else if sesh_state == 4
+    if not in_trade_sesh
+        sesh_state := 6
+    else
+        bool rev_close = t1_dir == 1 ? (close < orl) : (close > orh)
+        if rev_close
+            fire_trade_2(-t1_dir)
+            sesh_state := 5
+        else if cutoff_reached_now
+            sesh_state := 6
+
+// --- STEP C: Process State 1 (Waiting for Initial Breakout Close to Arm Trade 1) ---
+else if sesh_state == 1
+    if not in_trade_sesh or cutoff_reached_now
+        sesh_state := 6
+    else if or_valid
+        if close > orh
+            t1_dir     := 1
+            t1_entry   := math.round_to_mintick(orh - (fib_lvl * orw))
+            t1_sl      := math.round_to_mintick(orl)
+            t1_risk    := math.max(t1_entry - t1_sl, syminfo.mintick)
+            recent_ext := high
+            float raw_tp_dist  = recent_ext - t1_entry
+            float clamped_dist = math.min(t1_max_rr * t1_risk, math.max(t1_min_rr * t1_risk, raw_tp_dist))
+            t1_tp      := math.round_to_mintick(t1_entry + clamped_dist)
+
+            float qty_t1 = calc_qty(t1_risk)
+            closed_ref := strategy.closedtrades
+            strategy.entry("T1_Long", strategy.long, qty = qty_t1, limit = t1_entry, comment = "T1 Limit Long")
+            strategy.exit("T1_Long_Exit", from_entry = "T1_Long", stop = t1_sl, limit = t1_tp, comment_loss = "T1 SL", comment_profit = "T1 TP")
+            sesh_state := 2
+
+            entry_ln := line.new(bar_index, t1_entry, bar_index, t1_entry, color = bull_col, style = line.style_dotted)
+            tp_ln    := line.new(bar_index, t1_tp, bar_index, t1_tp, color = bull_col, style = line.style_dashed)
+
+        else if close < orl
+            t1_dir     := -1
+            t1_entry   := math.round_to_mintick(orl + (fib_lvl * orw))
+            t1_sl      := math.round_to_mintick(orh)
+            t1_risk    := math.max(t1_sl - t1_entry, syminfo.mintick)
+            recent_ext := low
+            float raw_tp_dist  = t1_entry - recent_ext
+            float clamped_dist = math.min(t1_max_rr * t1_risk, math.max(t1_min_rr * t1_risk, raw_tp_dist))
+            t1_tp      := math.round_to_mintick(t1_entry - clamped_dist)
+
+            float qty_t1 = calc_qty(t1_risk)
+            closed_ref := strategy.closedtrades
+            strategy.entry("T1_Short", strategy.short, qty = qty_t1, limit = t1_entry, comment = "T1 Limit Short")
+            strategy.exit("T1_Short_Exit", from_entry = "T1_Short", stop = t1_sl, limit = t1_tp, comment_loss = "T1 SL", comment_profit = "T1 TP")
+            sesh_state := 2
+
+            entry_ln := line.new(bar_index, t1_entry, bar_index, t1_entry, color = bear_col, style = line.style_dotted)
+            tp_ln    := line.new(bar_index, t1_tp, bar_index, t1_tp, color = bear_col, style = line.style_dashed)
